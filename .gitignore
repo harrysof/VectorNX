@@ -1,0 +1,24 @@
+# Game data and APKs -- never commit these.
+*.apk
+*.apks
+*.xapk
+stage/
+
+# Build outputs (attach the NRO to a release instead).
+build/
+*.nro
+*.elf
+*.nacp
+*.lst
+*.map
+
+# Logs and local pointer files.
+*.log
+pointer.cfg
+cursor.png
+
+# Editor / OS noise.
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
