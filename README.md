@@ -216,14 +216,32 @@ log=0
 
 ---
 
+## Save files
+
+The port stores game data on the SD card; there is no Nintendo title save.
+
+```text
+sdmc:/switch/vector/prefs.kv       Unity PlayerPrefs (settings/progress flags)
+sdmc:/switch/vector/UserData.data  the game's own progress/save file
+sdmc:/switch/vector/save/          created by staging; usually empty
+```
+
+To back up or move progress, copy **both** `prefs.kv` and `UserData.data` (or
+the whole `switch/vector` folder except `assets`). The launcher never deletes
+these files: "Replace existing game data" only clears `assets/bin/Data`.
+Exit with HOME and wait a moment before removing the SD card so the async SD
+commit can finish.
+
+---
+
 ## Performance notes
 
 This build targets the two causes the hardware logs actually showed:
 
-- **Frame pacing.** The NWindow swap interval is set explicitly to 1 (60 fps) or
-  2 (30 fps), and `eglSwapInterval` is clamped to the same value. The old
-  free-running 60 Hz sleep loop is gone; two independent 60 Hz clocks beat
-  against each other and produce periodic held/repeated frames.
+- **Frame pacing.** The NWindow swap interval is pinned to 1 (60 fps), and
+  `eglSwapInterval` is clamped to 1. The old free-running 60 Hz sleep loop is
+  gone; two independent 60 Hz clocks beat against each other and produce
+  periodic held/repeated frames. A `framerate=30` value is ignored.
 - **Managed frame cap.** Unity's Android player defaults `targetFrameRate` to
   30. The loader hard-locks it to 60 and re-asserts it every second through
   `il2cpp_resolve_icall`, without any libil2cpp offsets.
