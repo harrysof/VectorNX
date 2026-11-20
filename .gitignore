@@ -22,3 +22,7 @@ cursor.png
 .idea/
 Thumbs.db
 desktop.ini
+
+# Rust launcher build output and test fixtures.
+launcher/target/
+launcher/test-fixture/

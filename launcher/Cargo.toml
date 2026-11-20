@@ -1,0 +1,19 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+hex = "0.4.3"
+image = "0.25.10"
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+walkdir = "2.5.0"
+zip = { version = "9.8.1", features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

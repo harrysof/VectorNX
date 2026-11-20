@@ -82,6 +82,22 @@ stage/vector/
   save/                   (created empty)
 ```
 
+### Or use the Windows launcher
+
+`launcher/` is a Rust/egui setup app that automates the same steps:
+
+- validates the APK package and **1.5.0** version;
+- checks the patch status and requires an explicit confirmation for
+  patched/unverified APKs;
+- extracts the arm64 libraries and Unity data;
+- **always builds and verifies** `assets.nxpack` / `assets.nxidx` (the pack is
+  not optional);
+- copies `vector_nx.nro` and writes `config.txt` (language, resolution,
+  logging, hard-locked 60 fps).
+
+See `launcher/README.md` for building and the release layout. The launcher
+contains no game data; it operates entirely on your own local APK.
+
 ### 2. Copy to the SD card
 
 Copy the **contents** of `stage/vector/` to:
