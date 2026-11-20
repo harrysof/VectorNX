@@ -75,8 +75,9 @@ launcher.exe --install --apk <apk> --out <sd-folder> --nro <nro> [--lang en] [--
 - No APK, game libraries, assets, or pack files are committed to this
   repository.
 
-## Background asset
+## Artwork
 
-`assets/background.png` is an original dark runner/speed-line composition made
-for this launcher (`make_background.py` documents how it was generated). The
-Vector icon is the project's user-supplied `icon.png`.
+`assets/vector_bg.jpg` is the Vector key art supplied by the project owner.
+`assets/icon.png` is the project's user-supplied Vector icon. The launcher
+shows the art behind a single dark panel and uses only one accent colour
+(Vector blue) plus amber/red for warnings and errors.

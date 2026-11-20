@@ -107,7 +107,7 @@ fn run_cli(args: &[String]) -> Result<()> {
             Ok(())
         }
         "--version" => {
-            println!("VectorNX Setup 0.1.0 (loader 0.6.1-perf3)");
+            println!("VectorNX Setup 0.1.1 (loader 0.6.1-perf3)");
             Ok(())
         }
         "--check" => {
