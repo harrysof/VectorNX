@@ -46,6 +46,7 @@
 #include "unity_input_hook.h"
 #include "vector_patches.h"
 #include "nx_fonts.h"
+#include "asset_pack.h"
 #include "diag.h"
 
 #define DATA_ROOT  GAME_HOME
@@ -97,6 +98,7 @@ extern uintptr_t g_il2cpp_base;       /* libc_shim.c: GC stop-the-world bridge *
 extern size_t    g_il2cpp_size;       /* libc_shim.c: bounds guard for the same */
 extern void      nx_slow_open_dump(void);
 extern uint64_t  nx_stat_read_ticks, nx_stat_read_bytes;
+extern uint64_t  nx_stat_open_ticks;
 extern void nx_sd_flush(void);        /* libc_shim.c: periodic SD commit       */
 
 /* audio warmup gate for opensles.c (frames since boot) */
@@ -320,6 +322,43 @@ static void nx_choreo_tick(void) {
   }
 }
 
+/* Force Unity's managed frame-rate limit to match the window swap interval.
+ *
+ * The engine's native pacing is disabled by vector_patches.c (Swappy and the
+ * UnityChoreographer wait), so the only thing that can cap the player is
+ * Application.targetFrameRate -- and Unity's Android player defaults that to
+ * 30 when the game has not assigned it. The exact same signature strings are
+ * used by the lcgo port through il2cpp_resolve_icall, so this needs no
+ * libil2cpp offsets. Re-asserted periodically because a quality-level change
+ * or scene load can reapply the player default underneath us. */
+typedef void  *(*vec_resolve_icall_fn)(const char *);
+typedef void   (*vec_set_int_fn)(int);
+
+#if VEC_FORCE_FPS
+static void vec_force_target_framerate(void) {
+  static vec_set_int_fn set_tfr, set_vsync;
+  static int resolved;
+  if (!resolved) {
+    resolved = 1;
+    vec_resolve_icall_fn resolve =
+        (vec_resolve_icall_fn)so_try_find_addr_rx(&il2cpp_mod, "il2cpp_resolve_icall");
+    if (resolve) {
+      set_tfr = (vec_set_int_fn)resolve(
+          "UnityEngine.Application::set_targetFrameRate(System.Int32)");
+      set_vsync = (vec_set_int_fn)resolve(
+          "UnityEngine.QualitySettings::set_vSyncCount(System.Int32)");
+    }
+    debugPrintf("[fps] managed overrides: targetFrameRate=%p vSyncCount=%p\n",
+                (void *)set_tfr, (void *)set_vsync);
+  }
+  const int fps = (config.framerate == 30) ? 30 : 60;
+  if (set_tfr)   set_tfr(fps);
+  if (set_vsync) set_vsync(fps == 30 ? 2 : 1);
+}
+#else
+static void vec_force_target_framerate(void) { }
+#endif
+
 int main(int argc, char *argv[]) {
   (void)argc; (void)argv;
   socketInitializeDefault();
@@ -343,7 +382,17 @@ int main(int argc, char *argv[]) {
   {
     const char *cfg = DATA_ROOT "/" CONFIG_NAME;
     if (read_config(cfg) != 0) write_config(cfg);
+    /* Keep boot logging on until the first presented frames, even when the
+     * play setting is log=0. Memory setup, module load, patch guards and the
+     * first JNI calls are exactly what a black-screen report needs; the
+     * per-frame chatter is what we want gone. main.c applies config.log at
+     * frame 2, after the engine is live. */
   }
+
+  /* Start the low-priority sdmc commit worker before the game can write a
+   * save/pref/analytics file. Without it, the first close() of a written file
+   * pays a full filesystem commit on the game thread. */
+  nx_sd_async_init();
 
   check_syscalls();
   debugPrintf("[boot] syscalls ok\n");
@@ -395,6 +444,18 @@ int main(int argc, char *argv[]) {
   SDL_SetMainReady();
   if (SDL_Init(SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0)
     debugPrintf("SDL_Init failed: %s\n", SDL_GetError());
+
+#if VEC_ASSET_PACK
+  /* Mount the optional pack before the first asset open. A missing or invalid
+   * pair is not an error: the loose assets tree remains the fallback. */
+  if (asset_pack_open_existing(GAME_HOME)) {
+    debugPrintf("[pack] mounted: %u entries, %u MB payload\n",
+                (unsigned)asset_pack_entry_count(),
+                (unsigned)(asset_pack_data_size() >> 20));
+  } else {
+    debugPrintf("[pack] not mounted: %s (using loose assets)\n", asset_pack_error());
+  }
+#endif
 
   check_data();
 
@@ -551,11 +612,6 @@ int main(int argc, char *argv[]) {
    * nx_choreo_tick() drives the same tick from the main loop. */
 
   int frame = 0;
-  uint64_t next_frame_ns = 0;
-  {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    next_frame_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-  }
   while (appletMainLoop() && !jni_quit_requested) {
     diag_frame(frame);
     g_frame_count++;
@@ -566,6 +622,7 @@ int main(int argc, char *argv[]) {
     struct timespec _t0, _t1; clock_gettime(CLOCK_MONOTONIC, &_t0);
     unsigned _o0 = nx_stat_open, _c0 = nx_stat_commit, _m0 = nx_stat_mmap, _g0 = nx_stat_gcstop;
     const uint64_t _rt0 = nx_stat_read_ticks, _rb0 = nx_stat_read_bytes;
+    const uint64_t _ot0 = nx_stat_open_ticks;
 
     nx_choreo_tick();
 
@@ -585,9 +642,10 @@ int main(int argc, char *argv[]) {
       if (_ms >= 20) {
         const unsigned long long _rdms = (unsigned long long)((nx_stat_read_ticks - _rt0) / 19200);
         const unsigned long long _rdkb = (unsigned long long)((nx_stat_read_bytes - _rb0) / 1024);
-        debugPrintf("[perf] frame %d took %ldms  open=%u sd=%u mmap=%u gc=%u  read=%llums/%lluKB  touch=%d\n",
+        const unsigned long long _oms  = (unsigned long long)((nx_stat_open_ticks - _ot0) / 19200);
+        debugPrintf("[perf] frame %d took %ldms  open=%u openms=%llu sd=%u mmap=%u gc=%u  read=%llums/%lluKB  touch=%d\n",
                     frame, _ms,
-                    nx_stat_open - _o0, nx_stat_commit - _c0,
+                    nx_stat_open - _o0, _oms, nx_stat_commit - _c0,
                     nx_stat_mmap - _m0, nx_stat_gcstop - _g0,
                     _rdms, _rdkb, nx_hook_touch_count());
         if (_ms >= 50) nx_slow_open_dump();
@@ -599,6 +657,15 @@ int main(int argc, char *argv[]) {
         perf_sum_ns = 0; perf_n = 0; perf_max = 0; perf_over16 = 0;
       }
     }
+    /* Frame 2 is the earliest point the managed runtime is fully live; a
+     * quality change or scene load can reapply Unity's 30 fps mobile default,
+     * so re-assert it periodically. */
+    if (frame == 2 || (frame % 300) == 0) vec_force_target_framerate();
+    if (frame == 2) {
+      extern int g_debug_log;
+      debugPrintf("[boot] boot complete; log=%d from here\n", config.log);
+      g_debug_log = config.log;
+    }
     if (frame < 5 || (frame % 120) == 0) debugPrintf("[boot] frame %d rendered\n", frame);
     frame++;
     if (frame == 1800) {
@@ -606,14 +673,13 @@ int main(int argc, char *argv[]) {
        * frame-rate target benefits more than the small thermal cost hurts. */
       debugPrintf("[boot] CPU boost stays on (performance mode)\n");
     }
-    if ((frame % 120) == 0) nx_sd_flush();   /* commit pending save ~every 2s */
+    if ((frame % 120) == 0) nx_sd_flush_async();   /* ~2s durability, no frame stall */
 
-    /* ~60fps frame limiter. No real display vsync; pacing avoids flooding vi. */
-    next_frame_ns += 16666667ULL;
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-    if ((int64_t)(next_frame_ns - now) > 0) svcSleepThread(next_frame_ns - now);
-    else next_frame_ns = now;
+    /* Presentation is paced by nwindowSetSwapInterval(1) + eglSwapInterval(1)
+     * (android_native_unity.c / unity_imports.c). Do NOT add a second sleep
+     * loop here: two independent 60 Hz clocks beat against each other, which
+     * shows up as a periodic held/repeated frame even when the average is
+     * exactly 60 fps. That was the old limiter. */
   }
 
   Unity_nativeApplicationUnload(fake_env, fake_unityplayer_thiz);
@@ -622,6 +688,11 @@ int main(int argc, char *argv[]) {
   opensles_shutdown();
   SDL_Quit();
   socketExit();
+
+  /* Final durability pass: focus/exit are the two points where waiting for
+   * fsdevCommitDevice is worth it. Then stop the worker. */
+  nx_sd_flush();
+  nx_sd_async_shutdown();
 
   extern void NX_NORETURN __libnx_exit(int rc);
   __libnx_exit(0);

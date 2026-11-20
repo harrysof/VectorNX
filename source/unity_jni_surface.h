@@ -20,6 +20,7 @@ static const unity_jni_class UNITY_JNI_CLASSES[] = {
   { "android/content/res/AssetManager",     JNI_IMPLEMENT, "open()/openFd() -> read staged files from SD" },
   { "android/content/SharedPreferences",    JNI_IMPLEMENT, "PlayerPrefs save data; getX/contains" },
   { "android/content/SharedPreferences$Editor", JNI_IMPLEMENT, "putX/remove/commit -> persist to SD" },
+  { "java/util/Scanner",                    JNI_IMPLEMENT, "boot.config reader; appends worker caps" },
   { "android/view/Display",                 JNI_IMPLEMENT, "getRealSize/getRefreshRate -> Switch values" },
   { "android/hardware/display/DisplayManager", JNI_IMPLEMENT, "getDisplay -> single display" },
   { "android/content/res/Configuration",    JNI_IMPLEMENT, "density/locale -> static" },

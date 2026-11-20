@@ -40,6 +40,7 @@
 #include "so_util.h"
 #include "libc_shim.h"
 #include "nx_fonts.h"   /* Switch shared fonts served as /system/fonts (CJK glyphs) */
+#include "asset_pack.h" /* read-only packed assets (Phase B) */
 #include "android_native_unity.h"
 #include "diag.h"
 
@@ -483,6 +484,10 @@ static long ra_read(struct RaCache *c, int fd, void *buf, size_t count) {
  * archive reader see data.unity3d as empty/mis-positioned ("Unable to read
  * header from archive file"), since it lseek64(SEEK_END)s to size the file. */
 long z_lseek(int fd, long off, int whence) {
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(fd)) return asset_pack_lseek_fd(fd, off, whence);
+#endif
+  if (fakefd_is_fake(fd)) return fakefd_lseek(fd, off, whence);
   struct RaCache *c = ra_find(fd);
   if (c) {   /* virtualized position -- don't touch the real fd here */
     mutexLock(&c->lock);
@@ -600,6 +605,7 @@ static int fd_close_by_path(const char *path) {
  * guessing. Plain ints: single-writer per counter in practice and we only need magnitudes. */
 unsigned nx_stat_open = 0, nx_stat_commit = 0, nx_stat_mmap = 0, nx_stat_gcstop = 0;
 uint64_t nx_stat_read_ticks = 0, nx_stat_read_bytes = 0;
+uint64_t nx_stat_open_ticks = 0;   /* total time inside open/openat, in system ticks */
 
 /* ---- slow-open diagnostic -------------------------------------------------
  * Every real open on Horizon is a FAT directory lookup + metadata read; on a
@@ -644,6 +650,105 @@ static void mark_write_fd(int fd)   { nx_sd_dirty = 1; if (fd >= 0 && fd < WFD_M
  * 120 frames (~2s, dirty-gated) and nx_applet_hook on focus-change / exit-request, which covers
  * quitting via HOME. So we simply leave the dirty flag set and let those do the work -- saves
  * are still durable within ~2s and guaranteed on exit, without stalling the frame that wrote. */
+/* ---- asynchronous sdmc commit ---------------------------------------------
+ * fsdevCommitDevice() is a full filesystem commit and costs tens of
+ * milliseconds. It used to run inline on close(), on the game thread, so every
+ * tap/analytics write could stall a frame. The commit is still required (libnx
+ * buffers sdmc: writes in RAM), but nothing on the game thread needs to wait
+ * for it: a low-priority worker performs the commit and the caller returns.
+ *
+ * Explicit flush points (applet focus change / exit) still use the synchronous
+ * nx_sd_flush() -- those are exactly the moments where durability matters more
+ * than the frame. */
+static Mutex   g_sd_commit_lock;    /* protects req/run + condvar            */
+static Mutex   g_sd_commit_io_lock; /* serialises fsdevCommitDevice()        */
+static CondVar g_sd_commit_cv;
+static Thread  g_sd_commit_thread;
+static int     g_sd_commit_run;
+static int     g_sd_commit_req;
+static int     g_sd_commit_started;
+
+/* Caller holds g_sd_commit_io_lock. A commit that takes >=20 ms is logged so
+ * the next hardware log can correlate it with a >16 ms frame. */
+static void sd_commit_device(void) {
+  const uint64_t t0 = svcGetSystemTick();
+  fsdevCommitDevice("sdmc");
+  const unsigned long long ms =
+      (unsigned long long)((svcGetSystemTick() - t0) / 19200);
+  if (ms >= 20) debugPrintf("[sd] commit took %llums\n", ms);
+}
+
+static void sd_commit_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    mutexLock(&g_sd_commit_lock);
+    while (!g_sd_commit_req && g_sd_commit_run)
+      condvarWait(&g_sd_commit_cv, &g_sd_commit_lock);
+    if (!g_sd_commit_run) { mutexUnlock(&g_sd_commit_lock); break; }
+    g_sd_commit_req = 0;
+    mutexUnlock(&g_sd_commit_lock);
+
+    mutexLock(&g_sd_commit_io_lock);
+    sd_commit_device();
+    mutexUnlock(&g_sd_commit_io_lock);
+  }
+}
+
+void nx_sd_async_init(void) {
+  static int io_lock_ready;
+  if (!io_lock_ready) { mutexInit(&g_sd_commit_io_lock); io_lock_ready = 1; }
+#if !VEC_ASYNC_COMMIT
+  debugPrintf("[sd] async commit disabled by config\n");
+  return;
+#endif
+  if (g_sd_commit_started) return;
+  mutexInit(&g_sd_commit_lock);
+  condvarInit(&g_sd_commit_cv);
+  g_sd_commit_run = 1;
+  if (R_FAILED(threadCreate(&g_sd_commit_thread, sd_commit_worker, NULL, NULL,
+                            0x8000, 0x3B, -2)) ||
+      R_FAILED(threadStart(&g_sd_commit_thread))) {
+    g_sd_commit_run = 0;
+    g_sd_commit_started = 0;
+    debugPrintf("[sd] async commit: worker start failed -- synchronous commits\n");
+    return;
+  }
+  g_sd_commit_started = 1;
+  debugPrintf("[sd] async commit worker armed\n");
+}
+
+void nx_sd_async_shutdown(void) {
+  if (!g_sd_commit_started) return;
+  mutexLock(&g_sd_commit_lock);
+  g_sd_commit_run = 0;
+  condvarWakeAll(&g_sd_commit_cv);
+  mutexUnlock(&g_sd_commit_lock);
+  threadWaitForExit(&g_sd_commit_thread);
+  threadClose(&g_sd_commit_thread);
+  g_sd_commit_started = 0;
+}
+
+static void sd_commit_request(void) {
+  if (!g_sd_commit_started) {
+    mutexLock(&g_sd_commit_io_lock);
+    sd_commit_device();
+    mutexUnlock(&g_sd_commit_io_lock);
+    return;
+  }
+  mutexLock(&g_sd_commit_lock);
+  g_sd_commit_req = 1;
+  condvarWakeOne(&g_sd_commit_cv);
+  mutexUnlock(&g_sd_commit_lock);
+}
+
+/* Periodic path: never blocks the render thread. */
+void nx_sd_flush_async(void) {
+  if (!nx_sd_dirty) return;
+  nx_sd_dirty = 0;
+  nx_stat_commit++;
+  sd_commit_request();
+}
+
 static void commit_write_fd(int fd) {
   if (fd < 0 || fd >= WFD_MAX || !g_write_fd[fd]) return;
   g_write_fd[fd] = 0;
@@ -658,16 +763,23 @@ static void commit_write_fd(int fd) {
    * moment the game finishes writing it. nx_sd_flush() stays as the periodic safety net. */
   nx_sd_dirty = 0;
   nx_stat_commit++;
-  fsdevCommitDevice("sdmc");
+  sd_commit_request();
 }
 
-/* Commit any pending writes to the physical card. Called periodically from the render loop and
- * after the game's save (nx_save_prefs), so the save survives a HOME-kill / reboot. */
+/* Commit any pending writes to the physical card. Called on focus-change and
+ * exit, where durability is worth the wait; the periodic render-loop path uses
+ * nx_sd_flush_async() above and never stalls the game thread. */
+void nx_sd_commit_now(void) {
+  mutexLock(&g_sd_commit_io_lock);
+  sd_commit_device();
+  mutexUnlock(&g_sd_commit_io_lock);
+}
+
 void nx_sd_flush(void) {
   if (!nx_sd_dirty) return;
   nx_sd_dirty = 0;
   nx_stat_commit++;
-  fsdevCommitDevice("sdmc");
+  nx_sd_commit_now();
 }
 
 /* Unity probes filesystem case-sensitivity on every boot: it creates
@@ -814,6 +926,8 @@ static int ofdcache_held(int fd) {
 int open_fake(const char *path, int flags, ...) {
   nx_stat_open++;
   const uint64_t _ot0 = svcGetSystemTick();
+#define OPEN_DONE(v) do { nx_stat_open_ticks += (uint64_t)(svcGetSystemTick() - _ot0); \
+                          return (v); } while (0)
   path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   char _rbuf[512];
   path = casetest_redirect(path);
@@ -822,7 +936,27 @@ int open_fake(const char *path, int flags, ...) {
   if (flags & LINUX_O_CREAT) { va_list va; va_start(va, flags); mode = va_arg(va, int); va_end(va); }
   const int cvt = convert_open_flags(flags);
   const int writing = (flags & 3) != 0 || (flags & LINUX_O_CREAT);
+  /* The 0.5.0 log showed 567 UserData.data opens. Log the first few flags so
+   * the next run can tell whether a safe read cache is possible or whether the
+   * game opens it read/write (in which case holding it open risks the save). */
+  if (strstr(path, "UserData.data")) {
+    static unsigned ud_n;
+    if (ud_n++ < 16)
+      debugPrintf("[io] UserData open flags=0x%x writing=%d\n", flags, writing);
+  }
   if (!writing) {
+    /* The console's shared fonts are already decoded in RAM (nx_fonts.c).
+     * Serve them from a read-only memory fd instead of reopening the cached
+     * file: Unity probes the fallback chain repeatedly, and on a 0.3.0 log
+     * the story-text frame alone did 401 opens at ~30-40 ms each. */
+#if VEC_FONT_RAM_CACHE
+    size_t fsz = 0;
+    const void *fdata = nx_fonts_data(path, &fsz);
+    if (fdata) {
+      int ffd = fakefd_open_mem(fdata, fsz, 0);
+      if (ffd >= 0) { fd_ino_set(ffd, path); OPEN_DONE(ffd); }
+    }
+#endif
     // /dev/urandom + /dev/random: Switch has no /dev node, but Mono/.NET (RNG
     // seeds, Guid.NewGuid, hashtable randomization) and asset crypto open these.
     // A failing open (-1) leaves those paths without entropy and can stall the
@@ -838,12 +972,20 @@ int open_fake(const char *path, int flags, ...) {
       int rfd = open(tf, O_RDONLY);
       fd_ino_set(rfd, path);
       debugPrintf("[io] open(%s,0x%x) -> %d [urandom]\n", path, flags, rfd);
-      return rfd;
+      OPEN_DONE(rfd);
     }
     // synthetic /proc, /sys (incl. self/maps)
     int sfd = synth_proc_open(path);
-    if (sfd >= 0) { fd_ino_set(sfd, path); debugPrintf("[io] open(%s,0x%x) -> %d [synthetic]\n", path, flags, sfd); return sfd; }
+    if (sfd >= 0) { fd_ino_set(sfd, path); debugPrintf("[io] open(%s,0x%x) -> %d [synthetic]\n", path, flags, sfd); OPEN_DONE(sfd); }
   }
+#if VEC_ASSET_PACK
+  /* Packed game files: a sorted path lookup instead of a FAT directory walk.
+   * The loose tree remains the fallback, so a miss here is harmless. */
+  if (!writing && asset_pack_active()) {
+    int pfd = asset_pack_open_path(path);
+    if (pfd >= 0) OPEN_DONE(pfd);
+  }
+#endif
   /* Repeat read-only open of a file we are already holding: hand back a dup and skip the
    * directory lookup entirely (see OPEN-FD CACHE above). */
   if (!writing) {
@@ -853,7 +995,7 @@ int open_fake(const char *path, int flags, ...) {
       static unsigned ohits = 0;
       if (++ohits <= 3 || (ohits % 50) == 0)
         debugPrintf("[io] open(%s) -> %d [fd-cache, no SD lookup, hit #%u]\n", path, cfd, ohits);
-      return cfd;
+      OPEN_DONE(cfd);
     }
   }
 
@@ -887,7 +1029,8 @@ int open_fake(const char *path, int flags, ...) {
     debugPrintf("[io] open(%s,0x%x) -> %d\n", path, flags, fd);
   }
   nx_slow_open_note(path, (int)((svcGetSystemTick() - _ot0) / 19200));
-  return fd;
+  OPEN_DONE(fd);
+#undef OPEN_DONE
 }
 int openat_fake(int dirfd, const char *path, int flags, ...) {
   (void)dirfd;
@@ -1068,6 +1211,12 @@ int rename_fake(const char *oldp, const char *newp) {
  * entry point needs the redirect, not just open(); this was the one I missed. */
 void *opendir_fake(const char *path) {
   path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
+#if VEC_ASSET_PACK
+  if (asset_pack_active()) {
+    void *pd = asset_pack_opendir_path(path);
+    if (pd) return pd;
+  }
+#endif
   return (void *)opendir(path);
 }
 
@@ -1075,6 +1224,38 @@ int stat_fake(const char *path, struct bionic_stat *st) {
   path = nx_fonts_resolve(path);   /* Switch system fonts as /system/fonts */
   char _rbuf[512];
   path = asset_redirect(path, _rbuf, sizeof _rbuf);
+#if VEC_ASSET_PACK
+  if (asset_pack_active()) {
+    uint64_t psz = 0, pino = 0; int pdir = 0;
+    if (asset_pack_stat_path_info(path, &psz, &pino, &pdir)) {
+      if (st) {
+        memset(st, 0, sizeof *st);
+        st->st_size = (long long)psz;
+        st->st_ino = pino;
+        st->st_mode = pdir ? 0040755 : 0100644;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+      }
+      return 0;
+    }
+  }
+#endif
+#if VEC_FONT_RAM_CACHE
+  /* A cached face's size is known without a FAT lookup. The file does exist on
+   * SD, so this only removes latency, not correctness. */
+  {
+    size_t fsz = 0;
+    if (nx_fonts_data(path, &fsz)) {
+      memset(st, 0, sizeof *st);
+      st->st_size = (long long)fsz;
+      st->st_mode = 0100644;
+      st->st_nlink = 1;
+      st->st_blksize = 4096;
+      st->st_ino = path_ino(path);
+      return 0;
+    }
+  }
+#endif
   struct stat real; int r = stat(path, &real);
   if (r != 0) {
     char alt[320];
@@ -1087,6 +1268,36 @@ int stat_fake(const char *path, struct bionic_stat *st) {
   return r;
 }
 int fstat_fake(int fd, struct bionic_stat *st) {
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(fd)) {
+    uint64_t psz = 0, pino = 0; int pdir = 0;
+    if (asset_pack_fstat_fd(fd, &psz, &pino, &pdir)) {
+      if (st) {
+        memset(st, 0, sizeof *st);
+        st->st_size = (long long)psz;
+        st->st_ino = pino;
+        st->st_mode = pdir ? 0040755 : 0100644;
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+        st->st_blocks = (long long)((psz + 511) / 512);
+      }
+      return 0;
+    }
+  }
+#endif
+  if (fakefd_is_fake(fd)) {
+    unsigned long long sz = 0, ino = 0;
+    if (!fakefd_stat(fd, &sz, &ino)) return -1;
+    if (st) {
+      memset(st, 0, sizeof *st);
+      st->st_size = (long long)sz;
+      st->st_ino = ino;
+      st->st_mode = 0100644;
+      st->st_nlink = 1;
+      st->st_blksize = 4096;
+    }
+    return 0;
+  }
   struct stat real; const int r = fstat(fd, &real);
   if (r == 0) {
     convert_stat(&real, st);
@@ -1109,6 +1320,19 @@ struct bionic_dirent {
 
 void *readdir_fake(void *dirp) {
   static struct bionic_dirent out; // not thread-safe (matches bionic readdir)
+#if VEC_ASSET_PACK
+  if (asset_pack_active() && asset_pack_dir_is(dirp)) {
+    uint8_t type = 0; uint64_t ino = 0;
+    const char *name = asset_pack_readdir_path(dirp, &type, &ino);
+    if (!name) return NULL;
+    memset(&out, 0, sizeof(out));
+    out.d_ino = ino;
+    out.d_reclen = sizeof(out);
+    out.d_type = type;
+    snprintf(out.d_name, sizeof(out.d_name), "%s", name);
+    return &out;
+  }
+#endif
   struct dirent *e = readdir((DIR *)dirp);
   if (!e) return NULL;
   memset(&out, 0, sizeof(out));
@@ -1117,6 +1341,13 @@ void *readdir_fake(void *dirp) {
   out.d_type = e->d_type;
   snprintf(out.d_name, sizeof(out.d_name), "%s", e->d_name);
   return &out;
+}
+
+int closedir_fake(void *dirp) {
+#if VEC_ASSET_PACK
+  if (asset_pack_active() && asset_pack_dir_is(dirp)) return asset_pack_closedir_path(dirp);
+#endif
+  return closedir((DIR *)dirp);
 }
 
 // ---------------------------------------------------------------------------
@@ -1727,6 +1958,45 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
   (void)addr;
   if (length == 0) length = 1;
 
+#if VEC_ASSET_PACK
+  /* A packed asset is not a POSIX fd. Unity maps SerializedFiles and bundles,
+   * so copy the requested window into an anonymous mapping. */
+  if (asset_pack_fd_is(fd)) {
+    uint64_t psz = 0, pino = 0; int pdir = 0;
+    if (!asset_pack_fstat_fd(fd, &psz, &pino, &pdir) || pdir ||
+        offset < 0 || (uint64_t)offset >= psz) {
+      errno = EINVAL; return (void *)-1;
+    }
+    void *p = mmap_fallback(length, flags | BIONIC_MAP_ANONYMOUS, -1, 0);
+    if (!p) { errno = ENOMEM; return (void *)-1; }
+    size_t n = length;
+    if ((uint64_t)offset + n > psz) n = (size_t)(psz - (uint64_t)offset);
+    if (n && asset_pack_pread_fd(fd, p, n, offset) != (long)n) {
+      mmap_fallback_free(p);
+      errno = EIO;
+      return (void *)-1;
+    }
+    if (n < length) memset((char *)p + n, 0, length - n);
+    return p;
+  }
+#endif
+
+  /* Font memory fds are not POSIX descriptors; serve a read-only mapping from
+   * the RAM copy. Unity normally reads faces, but handle mmap defensively so a
+   * future path cannot fall through to read() on a fake descriptor. */
+  if (fakefd_is_fake(fd)) {
+    unsigned long fsz = 0;
+    const void *src = fakefd_data(fd, &fsz);
+    if (!src || offset < 0 || (size_t)offset >= fsz) { errno = EINVAL; return (void *)-1; }
+    void *p = mmap_fallback(length, flags | BIONIC_MAP_ANONYMOUS, -1, 0);
+    if (!p) { errno = ENOMEM; return (void *)-1; }
+    size_t n = length;
+    if ((size_t)offset + n > fsz) n = (size_t)fsz - (size_t)offset;
+    memcpy(p, (const char *)src + offset, n);
+    if (n < length) memset((char *)p + n, 0, length - n);
+    return p;
+  }
+
   /* READ-ONLY FILE MAP DEDUP -- checked FIRST, before we allocate or touch the SD card.
    *
    * Unity symbolicates native stack frames by re-opening its own libunity.so and mapping the
@@ -1983,6 +2253,19 @@ FILE *fopen_fake(const char *path, const char *mode) {
     return fmemopen((void *)strdup(synth), n ? n : 1, "r");
   }
   const int writing = strpbrk(mode, "wa+") != NULL;
+#if VEC_FONT_RAM_CACHE
+  /* FreeType/Unity may open a face through stdio rather than open(). Serve the
+   * cached bytes from RAM here too; a FILE over a caller-owned buffer does not
+   * own it, so fclose() leaves the cache intact. */
+  if (!writing) {
+    size_t fsz = 0;
+    const void *fdata = nx_fonts_data(path, &fsz);
+    if (fdata) {
+      FILE *mf = fmemopen((void *)fdata, fsz, "rb");
+      if (mf) return mf;
+    }
+  }
+#endif
   FILE *f = fopen(path, mode);
   if (!f && writing) {            // save file: create the subdir and retry
     mkdir_parents(path);
@@ -2092,6 +2375,11 @@ int vfprintf_fake(FILE *f, const char *fmt, va_list va) {
 long read_fake(int fd, void *buf, size_t count) {
   const uint64_t _rt0 = svcGetSystemTick();
   long ret;
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(fd)) {
+    ret = asset_pack_read_fd(fd, buf, count);
+  } else
+#endif
   if (fakefd_is_fake(fd)) {
     ret = fakefd_read(fd, buf, count);
   } else {
@@ -2128,6 +2416,9 @@ long write_fake(int fd, const void *buf, size_t count) {
   return write(fd, buf, count);
 }
 int close_fake(int fd) {
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(fd)) return asset_pack_close_fd(fd);
+#endif
   /* Descriptor we are deliberately holding open for reuse (see OPEN-FD CACHE): swallow the
    * close. Keep g_fd_ino intact -- the mapping cache keys off it on the next open. */
   if (ofdcache_held(fd)) return 0;

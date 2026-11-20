@@ -44,6 +44,20 @@ typedef struct ALooper       ALooper;
 static u32 g_w = 720, g_h = 1280;   /* fbstub45 PORTRAIT (stable) */
 extern int screen_width, screen_height;   /* the render resolution main.c resolved (config/auto) */
 
+/* One present per display refresh for 60 fps, one every second refresh for 30.
+ *
+ * The port previously left the NWindow swap interval unset and paced itself
+ * with svcSleepThread. That is a free-running 60 Hz timer against a 60 Hz
+ * display: the two clocks beat, so even a "60 fps" average periodically shows
+ * a held or repeated frame. libnx's default is 1, but switch-mesa rebuilds the
+ * swapchain inside eglCreateWindowSurface and does not necessarily preserve it.
+ * Every working port in this lineage (lcgo, CloverPit) sets it explicitly and
+ * re-asserts it after the surface is created; lcgo's note is unambiguous:
+ * unset means the compositor does not throttle at all. */
+static u32 nx_swap_interval(void) {
+  return (config.framerate == 30) ? 2u : 1u;
+}
+
 void android_native_update_mode(void){
   /* The NWindow buffer MUST match the resolution Unity renders/reports (screen_width/height),
    * or the game renders at one size into a buffer of another -> zoom/crop. main.c sets those
@@ -76,6 +90,7 @@ static void nx_window_set_geom(NWindow *w, u32 bw, u32 bh) {
   nwindowSetDimensions(w, bw, bh);
   nwindowSetCrop(w, 0, 0, bw, bh);
   nwindowSetTransform(w, 0u);   /* identity: landscape buffer -> landscape panel */
+  nwindowSetSwapInterval(w, nx_swap_interval());
   static int nlog = 0;
   if (nlog < 6) {
     nlog++;
@@ -93,6 +108,10 @@ void nx_window_reassert(void) {
   NWindow *w = nwindowGetDefault();
   nwindowSetCrop(w, 0, 0, g_geom_bw, g_geom_bh);
   nwindowSetTransform(w, 0u);
+  /* mesa resets the swap interval when it builds/rebuilds the swapchain, so
+   * this is re-applied after every eglCreateWindowSurface and for the first
+   * few presents. Cheap: one property write. */
+  nwindowSetSwapInterval(w, nx_swap_interval());
 }
 
 ANativeWindow *android_native_window(void){

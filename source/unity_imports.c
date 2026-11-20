@@ -23,6 +23,7 @@
 #include <zlib.h>
 #include <switch.h>
 #include <unistd.h>      /* dup */
+#include "config.h"     /* config.framerate -> swap interval */
 #include "imports.h"   /* DynLibFunction */
 #include "diag.h"
 
@@ -167,6 +168,16 @@ int z_toupper_l (int c, void *l){ (void)l; return toupper(c); }
 void z_sincos(double x,double*s,double*c){ if(s)*s=sin(x); if(c)*c=cos(x); }
 void*z_memrchr(const void*s,int c,unsigned long n){ const unsigned char*p=(const unsigned char*)s+n; while(n--){ if(*--p==(unsigned char)c) return (void*)p; } return 0; }
 
+/* eglSwapInterval is the choke point every presentation path funnels through.
+ * Unity may ask for 0 (unthrottled) or for a value inherited from its Android
+ * quality profile; on this port the swapchain must be paced by the display,
+ * not by the loader's sleep loop. Clamp to the configured rate. */
+static EGLBoolean vec_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
+  const EGLint want = (config.framerate == 30) ? 2 : 1;
+  (void)interval;
+  return eglSwapInterval(dpy, want);
+}
+
 DynLibFunction unity_dynlib_functions[] = {
   { "ALooper_acquire", (uintptr_t)&ALooper_acquire },
   { "ALooper_forThread", (uintptr_t)&ALooper_forThread },
@@ -217,7 +228,7 @@ DynLibFunction unity_dynlib_functions[] = {
   { "eglGetProcAddress", (uintptr_t)&eglGetProcAddress },
   { "eglQueryString", (uintptr_t)&eglQueryString },
   { "eglSurfaceAttrib", (uintptr_t)&eglSurfaceAttrib },
-  { "eglSwapInterval", (uintptr_t)&eglSwapInterval },
+  { "eglSwapInterval", (uintptr_t)&vec_eglSwapInterval },
   { "exit", (uintptr_t)&exit },
   { "exp", (uintptr_t)&exp },
   { "exp2f", (uintptr_t)&exp2f },

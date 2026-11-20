@@ -60,6 +60,14 @@ files the loader needs:
 python tools/stage_sd.py <patched-vector.apk> --out stage/vector --nro vector_nx.nro
 ```
 
+Add `--pack` to also build `assets.nxpack` / `assets.nxidx` (recommended; see
+below):
+
+```powershell
+python tools/stage_sd.py <patched-vector.apk> --out stage/vector `
+    --nro vector_nx.nro --pack
+```
+
 Output:
 
 ```text
@@ -68,7 +76,9 @@ stage/vector/
   libmain.so
   libunity.so
   libil2cpp.so
-  assets/bin/Data/...     (Unity data)
+  assets/bin/Data/...     (Unity data, loose fallback)
+  assets.nxpack           (optional packed assets)
+  assets.nxidx
   save/                   (created empty)
 ```
 
@@ -86,6 +96,39 @@ So the card contains `sdmc:/switch/vector/vector_nx.nro`,
 ### 3. Launch
 
 Open hbmenu, hold **R** over any game, and choose `vector_nx`.
+
+### Optional but recommended: packed assets
+
+A loose Unity data tree is hundreds of separate files, and every asset open is
+a FAT directory lookup. On the 0.5.0 hardware log the first level load took
+**14.0 s with 348 opens**. The pack turns those opens into binary searches in a
+path index held in RAM.
+
+If you already staged (or already have the game on the SD card), build the pack
+without re-extracting:
+
+```powershell
+python tools/build_asset_pack.py `
+    --assets "E:\switch\vector\assets" `
+    --out    "E:\switch\vector"
+```
+
+Replace `E:` with the SD card's drive letter. The script verifies the pack it
+wrote; `--verify-only` re-checks an existing pair.
+
+The loader tries the pack first and falls back to the loose tree, so a missing
+or invalid pack cannot break the game. Keep the loose tree for now: the boot
+data check still expects it. With the pack mounted the boot log says:
+
+```text
+[pack] mounted: 1234 entries, 456 MB payload
+```
+
+Without it:
+
+```text
+[pack] not mounted: No complete asset pack was found (using loose assets)
+```
 
 ---
 
@@ -141,12 +184,50 @@ work with Vector's normal gesture handling.
 language=auto
 render_width=960
 render_height=540
+framerate=60
+log=0
 ```
 
 - `language`: `auto` or an ISO code (`en`, `ru`, `ja`, `zh_CN`, ...).
 - `render_width` / `render_height`: internal render size. The default
   **960x540** keeps the frame rate up; use `1280` / `720` for full quality.
   The Switch compositor upscales to the panel.
+- `framerate`: `60` or `30`. 60 sets the window swap interval to 1 and forces
+  Unity's managed `targetFrameRate` to 60; 30 uses swap interval 2.
+- `log`: `0` for play (no per-frame SD writes), `1` when you need `debug.log`.
+
+---
+
+## Performance notes
+
+This build targets the two causes the hardware logs actually showed:
+
+- **Frame pacing.** The NWindow swap interval is set explicitly to 1 (60 fps) or
+  2 (30 fps), and `eglSwapInterval` is clamped to the same value. The old
+  free-running 60 Hz sleep loop is gone; two independent 60 Hz clocks beat
+  against each other and produce periodic held/repeated frames.
+- **Managed frame cap.** Unity's Android player defaults `targetFrameRate` to
+  30. The loader re-asserts 60 (or 30) through `il2cpp_resolve_icall` without
+  any libil2cpp offsets.
+- **SD commit stalls.** `fsdevCommitDevice("sdmc")` is now performed by a
+  low-priority worker instead of on the game thread. Focus-change and exit
+  still commit synchronously.
+- **Logging.** `log=0` is the default. The crash path still writes a dump.
+- **Font fallback.** The console's shared fonts are decoded once and kept in
+  RAM; `open()` serves them from a read-only memory fd, so Unity's repeated
+  fallback probes do not touch the SD card.
+- **Input.** The touchscreen HID ring is drained and replayed oldest-to-newest,
+  so a swipe that spans a long frame is not lost or quantised to a single
+  sample.
+- **Packed assets.** With `assets.nxpack` mounted, asset opens become sorted
+  index lookups and reads come from one already-open file. `pread`, `mmap`,
+  `stat`, `fstat`, `access`, `opendir` and `readdir` all understand pack
+  handles. The loose tree remains the fallback.
+
+Set `log=1` to get `[fps]`/`[perf]` lines. The perf line now includes
+`openms=` (total time inside asset opens) and slow SD commits print
+`[sd] commit took <ms>`, so a remaining hitch can be attributed instead of
+guessed.
 
 ---
 
@@ -154,12 +235,14 @@ render_height=540
 
 - The intro and ending **cinematics are skipped**. This port has no Android
   MediaExtractor/MediaCodec decoder; the game continues at the title menu.
-- The first level load reads a lot from the microSD card. 0.4.4 uses a 2 MB
-  read-ahead window, 32 slots and per-file locks so the engine's loader threads
-  can overlap SD reads; a faster card still helps. `debug.log` reports frame
-  times, `read=...ms/...KB` and slow file opens.
-- If the screen is black, check the first line of
-  `sdmc:/switch/vector/debug.log`. It must say `vector_nx 0.4.4`.
+- The first level load reads a lot from the microSD card. The loose tree uses a
+  2 MB read-ahead window, 32 slots and per-file locks so the engine's loader
+  threads can overlap SD reads; the asset pack removes the per-file FAT opens
+  entirely. A faster card still helps both paths. `debug.log` reports frame
+  times, `open=... openms=...`, `read=...ms/...KB` and slow file opens.
+- If the screen is black, set `log=1` in `config.txt`, relaunch, and check the
+  first line of `sdmc:/switch/vector/debug.log`. It must say
+  `vector_nx 0.6.0-perf2`.
 - Audio is routed through OpenSL ES. If it is silent, the `[fmod]` lines in
   `debug.log` show which stage failed.
 

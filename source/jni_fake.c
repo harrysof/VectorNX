@@ -846,6 +846,12 @@ static void *j_GetFieldID(void *env, void *cls, const char *name, const char *si
  * unaffected (still a labelled object). */
 static void *new_object_dispatch(void *cls, void *mid, void *first_arg) {
   const char *cn = class_name_of(cls);
+  /* new Scanner(InputStream, charset): hand the stream to unity_jni.c, which
+   * owns the InputStream handles. Unity uses this to read boot.config. Without
+   * it the constructor produced a label-only object and every later call fell
+   * through to null/"", so the engine parsed an EMPTY boot.config. */
+  if (cn && strstr(cn, "java/util/Scanner"))
+    return unity_make_scanner(first_arg);
   if (cn && strstr(cn, "java/lang/String")) {
     FakeID *m = mid;
     if (m && strstr(m->sig, "[B")) {              /* String([B...) */

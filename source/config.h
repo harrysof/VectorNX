@@ -43,7 +43,7 @@
 #define CS_ANDROID_ID    "9f6a13c8d4e75b20"
 
 #define CONFIG_NAME "config.txt"
-#define VECTOR_VERSION "0.4.4"
+#define VECTOR_VERSION "0.6.0-perf2"
 #define LOG_NAME    "sdmc:/switch/vector/debug.log"
 
 /* Game data root == the .nro's own folder (SoLoader SD convention):
@@ -71,6 +71,28 @@
  * 10; the engine's TouchController is finger-indexed. */
 #define VEC_TOUCH_SLOTS 10
 
+/* ---- Unity job-worker caps ------------------------------------------------
+ * The Switch build gets three CPU cores. Unity 2022.3 sizes its JobSystem from
+ * the device, and on this engine generation that has been measured at NINE
+ * background workers plus two job workers -- far more runnable threads than
+ * three cores can schedule without introducing frame-time jitter. The lcgo
+ * port found this on hardware (15 engine threads, PlatformThread::Create
+ * waiting forever) and caps it from boot.config. We read the real boot.config
+ * now (see unity_jni.c's Scanner), and append these two keys; the engine's
+ * parser takes the LAST occurrence, so the user's own file stays untouched.
+ * Set VEC_BOOT_WORKER_CAP to 0 to leave the game's values exactly as shipped. */
+#define VEC_BOOT_WORKER_CAP 1
+#define VEC_BOOT_BG_WORKERS 3
+#define VEC_BOOT_JOB_WORKERS 2
+
+/* ---- performance rollback switches ---------------------------------------
+ * Each change is independently reversible so a hardware regression can be
+ * isolated in one rebuild instead of backing out the whole patch. */
+#define VEC_ASYNC_COMMIT    1   /* 0 = fsdevCommitDevice on the calling thread */
+#define VEC_FONT_RAM_CACHE  1   /* 0 = open the cached .fonts files from SD   */
+#define VEC_FORCE_FPS       1   /* 0 = leave Unity's managed frame cap alone   */
+#define VEC_ASSET_PACK      1   /* 0 = ignore assets.nxpack, use loose assets  */
+
 /* Boehm GC stop-the-world bridge. Vector disables automatic GC, but Unity still
  * runs an explicit collection at the end of the loading scene (the 0.2.3 log
  * hangs in GC_suspend_all at libil2cpp+0x181026c, retrying with 3s sleeps
@@ -86,6 +108,8 @@ typedef struct {
   char language[16];    /* "auto" => follow Switch system language, else ISO code */
   int  render_width;    /* internal render size; compositor upscales to the panel */
   int  render_height;
+  int  framerate;       /* 60 or 30; drives swap interval + targetFrameRate */
+  int  log;             /* 1 = write debug.log (slow); 0 = play build       */
 } Config;
 
 extern Config config;

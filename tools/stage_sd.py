@@ -16,6 +16,10 @@ writes the directory tree the loader expects:
 Usage:
     python tools/stage_sd.py Vector-Full-v1.5.0.apk --out E:\\switch\\vector
     python tools/stage_sd.py Vector-Full-v1.5.0.apk --out stage/vector --nro vector_nx.nro
+    python tools/stage_sd.py Vector-Full-v1.5.0.apk --out E:\\switch\\vector --pack
+
+--pack also builds assets.nxpack/assets.nxidx (see build_asset_pack.py). The
+loose assets tree is kept as a fallback.
 """
 import argparse
 import hashlib
@@ -54,6 +58,8 @@ def main():
                     help="output directory (default: stage/vector)")
     ap.add_argument("--nro", default=None,
                     help="optional built vector_nx.nro to copy into the output")
+    ap.add_argument("--pack", action="store_true",
+                    help="also build assets.nxpack/assets.nxidx for the loader")
     args = ap.parse_args()
 
     if not os.path.isfile(args.apk):
@@ -133,6 +139,12 @@ def main():
     missing = [r for r in REQUIRED if not os.path.isfile(os.path.join(out, r.replace("/", os.sep)))]
     if missing:
         sys.exit("missing after staging:\n  " + "\n  ".join(missing))
+
+    if args.pack:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from build_asset_pack import build_pack
+        print("\nBuilding packed assets (loose tree is kept as fallback)...")
+        build_pack(os.path.join(out, "assets"), out, verify=True)
 
     print(f"\nOK: SD layout ready at {out}")
     print("Copy that folder to sdmc:/switch/vector/ on the console, then launch")

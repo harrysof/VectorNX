@@ -44,6 +44,8 @@ extern int z_strncasecmp(const char *, const char *, unsigned long);  /* NULL-sa
 #include "so_util.h"
 #include "util.h"
 #include "libc_shim.h"
+#include "nx_fonts.h"   /* access() must follow the same font redirect as open() */
+#include "asset_pack.h" /* packed assets: pread/access/fsync/dup2 */
 #include "opensles.h"
 #include "imports.h"
 #include "android_native.h"
@@ -409,14 +411,39 @@ static int tcsetattr_stub(int fd, int opt, const void *t) { (void)fd; (void)opt;
 // POSIX file ops that devkitA64 newlib/libnx may not provide -- implement or
 // stub them locally so the link never depends on their presence.
 static int access_impl(const char *path, int mode) {
-  (void)mode; struct stat st; return stat(path, &st) == 0 ? 0 : -1;
+  (void)mode;
+#if VEC_ASSET_PACK
+  if (asset_pack_active()) {
+    uint64_t sz = 0, ino = 0; int isdir = 0;
+    if (asset_pack_stat_path_info(path, &sz, &ino, &isdir)) return 0;
+  }
+#endif
+  /* Android font discovery probes with access() as well as stat()/open().
+   * Without the redirect, /system/fonts/... never exists and Unity concludes
+   * the fallback list is empty. */
+  path = nx_fonts_resolve(path);
+  struct stat st; return stat(path, &st) == 0 ? 0 : -1;
 }
 static int chmod_stub(const char *path, int mode) { (void)path; (void)mode; return 0; }
 static int truncate_stub(const char *path, long len) { (void)path; (void)len; return 0; }
 static int ftruncate_stub(int fd, long len) { return ftruncate(fd, (off_t)len); }
-static int fsync_stub(int fd) { int r = fsync(fd); fsdevCommitDevice("sdmc"); return r; }
-static int dup2_stub(int a, int b) { (void)a; return b; }
+static int fsync_stub(int fd) {
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(fd)) return 0;   /* read-only, nothing to flush */
+#endif
+  int r = fsync(fd); nx_sd_commit_now(); return r;
+}
+static int dup2_stub(int a, int b) {
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(a)) return asset_pack_dup2_fd(a, b);
+#endif
+  (void)a; return b;
+}
 static long pread_impl(int fd, void *buf, size_t n, long off) {
+#if VEC_ASSET_PACK
+  if (asset_pack_fd_is(fd)) return asset_pack_pread_fd(fd, buf, n, off);
+#endif
+  if (fakefd_is_fake(fd)) return fakefd_pread(fd, buf, n, off);
   long cur = lseek(fd, 0, SEEK_CUR);
   if (cur < 0) return -1;
   if (lseek(fd, off, SEEK_SET) < 0) return -1;
@@ -810,7 +837,7 @@ DynLibFunction dynlib_functions[] = {
   { "link", (uintptr_t)&link_stub }, { "symlink", (uintptr_t)&symlink_stub },
   { "readlink", (uintptr_t)&readlink_stub }, { "utime", (uintptr_t)&ret0_i },
   { "utimensat", (uintptr_t)&utimensat_stub }, { "sendfile", (uintptr_t)&sendfile_stub },
-  { "opendir", (uintptr_t)&opendir_fake }, { "closedir", (uintptr_t)&closedir },
+  { "opendir", (uintptr_t)&opendir_fake }, { "closedir", (uintptr_t)&closedir_fake },
   { "readdir", (uintptr_t)&readdir_fake }, { "fdopendir", (uintptr_t)&fdopendir_stub },
   { "realpath", (uintptr_t)&realpath_fake },
   { "strerror", (uintptr_t)&strerror }, { "strerror_r", (uintptr_t)&strerror_r_fake },

@@ -4,6 +4,8 @@
 #ifndef NX_FONTS_H
 #define NX_FONTS_H
 
+#include <stddef.h>
+
 /* Extract + cache the console's shared fonts under <game_home>/.fonts and build
  * the font-config XML. Safe to call once at boot, before any module loads.
  * Returns the number of faces available (0 = non-Latin text will not render). */
@@ -23,5 +25,11 @@ int nx_fonts_is_config_path(const char *path);
 
 /* Generated fonts.xml content (first family = default, rest = fallbacks). */
 const char *nx_fonts_config_xml(void);
+
+/* In-memory copy of a cached face, keyed by the path nx_fonts_resolve()
+ * returns. The font bytes are already in RAM during extraction, so keeping
+ * them removes the repeated SD opens Unity performs while building its
+ * dynamic-font fallback list. Returns NULL for anything that is not a font. */
+const void *nx_fonts_data(const char *path, size_t *size);
 
 #endif /* NX_FONTS_H */

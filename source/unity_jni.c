@@ -5,6 +5,7 @@
  * standard Android framework API, so they're concrete; the spots that need
  * checking on hardware are marked CHECK. */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include <errno.h>
 
 #include "unity_jni.h"
+#include "asset_pack.h"
 #include "util.h"
 #include "config.h"   /* CS_PACKAGE etc. */
 
@@ -39,7 +41,7 @@ static int  ret_is(const char *sig,const char *t){ const char*p=strchr(sig,')');
  * -------------------------------------------------------------------------- */
 enum { UJ_TAG = 0x554a4831 /*'UJH1'*/ };
 enum { UJ_INPUTSTREAM, UJ_AFD, UJ_FD, UJ_PREFS, UJ_EDITOR, UJ_GENERIC,
-       UJ_MAP, UJ_SET, UJ_ITER, UJ_ENTRY, UJ_BOXED };
+       UJ_MAP, UJ_SET, UJ_ITER, UJ_ENTRY, UJ_BOXED, UJ_SCANNER };
 
 typedef struct {
   uint32_t tag; int kind;
@@ -50,6 +52,8 @@ typedef struct {
   char  btype;              /* UJ_BOXED: 'I' int 'L' long 'B' bool 'F' float*/
   long long bival;          /* UJ_BOXED int/long/bool payload               */
   double bfval;             /* UJ_BOXED float payload                       */
+  char  name[64];           /* UJ_INPUTSTREAM: asset name (boot.config)     */
+  void *src;                /* UJ_SCANNER: backing UJ_INPUTSTREAM           */
 } UHandle;
 
 static UHandle *uh_new(int kind){
@@ -61,10 +65,37 @@ static UHandle *uh_new(int kind){
 void unity_handle_free(void *p){
   UHandle *h = p; if (!h || h->tag!=UJ_TAG) return;
   if (h->fp) fclose(h->fp);
-  if (h->fd>=0) close(h->fd);
+  if (h->fd>=0) {
+#if VEC_ASSET_PACK
+    if (asset_pack_fd_is(h->fd)) asset_pack_close_fd(h->fd);
+    else
+#endif
+      close(h->fd);
+  }
   free(h);
 }
 static int is_uh(void *p,int kind){ UHandle*h=p; return h && h->tag==UJ_TAG && h->kind==kind; }
+
+/* new Scanner(InputStream, charset) -- called from jni_fake.c's constructor
+ * dispatcher. Unity reads assets/bin/Data/boot.config through this exact
+ * Java idiom:
+ *
+ *     new Scanner(getAssets().open("bin/Data/boot.config"), "UTF-8")
+ *         .useDelimiter("\\A").next()
+ *
+ * The port had no Scanner at all, so the constructor fell through to a
+ * label-only object and next() returned the generic "" string. In other words
+ * Unity has been parsing an EMPTY boot.config, losing the game's own
+ * job-worker counts and boot flags. The lcgo port found the same gap; it is
+ * also where the 3-background/2-job worker cap below comes from. */
+void *unity_make_scanner(void *inputstream){
+  UHandle *src = inputstream;
+  UHandle *h = uh_new(UJ_SCANNER);
+  h->src = (is_uh(src,UJ_INPUTSTREAM)) ? src : NULL;
+  debugPrintf("[scan] new Scanner(InputStream=%p) -> %s\n", inputstream,
+              h->src ? "backed" : "EMPTY (arg was not an InputStream)");
+  return h;
+}
 
 /* --------------------------------------------------------------------------
  * asset path: AssetManager.open("bin/Data/x") -> g_root/assets/bin/Data/x
@@ -214,6 +245,7 @@ int unity_owns_class(const char *cls){
          has(cls,"SharedPreferences") || has(cls,"SharedPreferences$Editor") ||
          has(cls,"java/util/Map") || has(cls,"java/util/Set") ||
          has(cls,"java/util/Iterator") || has(cls,"java/util/HashMap") ||
+         has(cls,"java/util/Scanner") ||
          has(cls,"view/Display") || has(cls,"DisplayManager") ||
          has(cls,"res/Configuration") || has(cls,"res/Resources") ||
          has(cls,"DisplayMetrics") || has(cls,"content/Context") ||
@@ -229,19 +261,52 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
     if (has(m,"openFd") || has(m,"openNonAssetFd")){
       const char *name = jni_string_utf(va_arg(va,void*));
       char path[320]; asset_path(path,sizeof path,name);
-      int fd = open(path,O_RDONLY);
+      int fd = -1;
+#if VEC_ASSET_PACK
+      if (asset_pack_active()) fd = asset_pack_open_path(path);
+#endif
+      if (fd < 0) fd = open(path,O_RDONLY);
       debugPrintf("[io] JNI AssetManager.openFd(%s) -> %s [%s]\n", name, fd>=0?"ok":"MISSING", path);
       if(fd<0){ return NULL; /* CHECK: engine expects exception; NULL usually ok */ }
-      struct stat st; fstat(fd,&st);
-      UHandle*h=uh_new(UJ_AFD); h->fd=fd; h->off=0; h->len=st.st_size; return h;
+      long flen = -1;
+#if VEC_ASSET_PACK
+      if (asset_pack_fd_is(fd)) {
+        uint64_t psz = 0;
+        if (asset_pack_fstat_fd(fd, &psz, NULL, NULL)) flen = (long)psz;
+      }
+#endif
+      if (flen < 0) { struct stat st; flen = fstat(fd,&st)==0 ? (long)st.st_size : 0; }
+      UHandle*h=uh_new(UJ_AFD); h->fd=fd; h->off=0; h->len=flen; return h;
     }
     if (has(m,"open")){
       const char *name = jni_string_utf(va_arg(va,void*));
       char path[320]; asset_path(path,sizeof path,name);
-      FILE*fp=fopen(path,"rb");
+      FILE*fp=NULL;
+#if VEC_ASSET_PACK
+      /* boot.config is the one asset Unity reads through stdio into a Scanner.
+       * Keep one decoded copy in RAM so this still works after the loose tree
+       * is removed (and so it never costs a FAT open). */
+      if (asset_pack_active() && name && strstr(name, "boot.config")) {
+        static void  *boot_data;
+        static size_t boot_size;
+        if (!boot_data) {
+          if (asset_pack_read_all_path(path, &boot_data, &boot_size)) {
+            debugPrintf("[pack] boot.config served from pack (%zu bytes)\n", boot_size);
+          } else {
+            boot_data = NULL;
+          }
+        }
+        if (boot_data) fp = fmemopen(boot_data, boot_size ? boot_size : 1, "rb");
+      }
+#endif
+      if (!fp) fp=fopen(path,"rb");
       debugPrintf("[io] JNI AssetManager.open(%s) -> %s [%s]\n", name, fp?"ok":"MISSING", path);
       if(!fp) return NULL;
-      UHandle*h=uh_new(UJ_INPUTSTREAM); h->fp=fp; return h;
+      UHandle*h=uh_new(UJ_INPUTSTREAM); h->fp=fp;
+      /* Remember the asset name so Scanner.next() can recognise boot.config
+       * and append the worker-count caps -- see unity_make_scanner(). */
+      if (name) { strncpy(h->name, name, sizeof h->name - 1); h->name[sizeof h->name - 1] = 0; }
+      return h;
     }
     if (has(m,"list")) return jni_make_object("String[]"); /* CHECK: empty array */
     return jni_make_object("AssetManager");
@@ -269,6 +334,65 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
     }
     if (has(m,"getStringSet")) return jni_make_object("Set");
     return jni_make_object("SharedPreferences");
+  }
+
+  /* java.util.Scanner -- see unity_make_scanner() for why this exists.
+   * useDelimiter()/reset()/skip() return `this` in Java; the boot.config idiom
+   * chains straight off them, so returning NULL here breaks the chain. next()
+   * is only ever used with the `\A` delimiter in this title, which means "the
+   * entire stream"; that is exactly what we return. */
+  if (has(cls,"java/util/Scanner")){
+    UHandle *h = recv;
+    if (has(m,"useDelimiter") || has(m,"reset") || has(m,"skip")) return recv;
+    if (has(m,"next") || has(m,"nextLine")){
+      UHandle *src = is_uh(h,UJ_SCANNER) ? (UHandle *)h->src : NULL;
+      FILE *fp = src ? src->fp : NULL;
+      if (!fp || h->idx){
+        debugPrintf("[scan] Scanner.%s -> \"\" (%s)\n", m,
+                    fp ? "already consumed" : "no backing stream");
+        return jni_make_string("");
+      }
+      long cur = ftell(fp);
+      fseek(fp,0,SEEK_END); long end = ftell(fp); fseek(fp,cur,SEEK_SET);
+      long n = end - cur;
+      if (n <= 0){ h->idx = 1; debugPrintf("[scan] Scanner.%s -> \"\" (empty)\n", m);
+                   return jni_make_string(""); }
+      char *buf = malloc((size_t)n + 1);
+      if (!buf) return jni_make_string("");
+      size_t got = fread(buf,1,(size_t)n,fp);
+      buf[got] = 0;
+      h->idx = 1;                          /* one token, per the \A delimiter */
+      debugPrintf("[scan] Scanner.%s -> %zu bytes\n", m, got);
+
+#if VEC_BOOT_WORKER_CAP
+      if (src && src->name[0] && strstr(src->name, "boot.config")) {
+        char cap[128];
+        int caplen = snprintf(cap, sizeof cap,
+                              "\nbackground-job-worker-count=%d"
+                              "\njob-worker-count=%d\n",
+                              VEC_BOOT_BG_WORKERS, VEC_BOOT_JOB_WORKERS);
+        if (caplen > 0 && caplen < (int)sizeof cap) {
+          char *cfg = malloc(got + (size_t)caplen + 1);
+          if (cfg) {
+            memcpy(cfg, buf, got);
+            memcpy(cfg + got, cap, (size_t)caplen + 1);
+            debugPrintf("[scan] boot.config: appended worker caps "
+                        "(background=%d, job=%d) -- %zu -> %zu bytes\n",
+                        VEC_BOOT_BG_WORKERS, VEC_BOOT_JOB_WORKERS,
+                        got, got + (size_t)caplen);
+            free(buf);
+            void *rc = jni_make_string(cfg);
+            free(cfg);
+            return rc;
+          }
+        }
+      }
+#endif
+      void *rc = jni_make_string(buf);
+      free(buf);
+      return rc;
+    }
+    return jni_make_string("");
   }
 
   /* ---- getAll() Map iteration: Map.entrySet/keySet -> Set -> Iterator -> ----
@@ -365,6 +489,12 @@ void *unity_dispatch_object(void *recv, const void *id_, va_list va){ const stru
 uint64_t unity_dispatch_int(void *recv, const void *id_, va_list va){ const struct FakeID *id = id_;
   const char *cls=id->cls, *m=id->name;
 
+  /* Scanner.hasNext(): true until the one `\A` token has been consumed. */
+  if (has(cls,"java/util/Scanner") && has(m,"hasNext")){
+    UHandle *h = recv;
+    return (uint64_t)((is_uh(h,UJ_SCANNER) && !h->idx) ? 1 : 0);
+  }
+
   /* getAll() iteration: Iterator.hasNext + a few Map predicates. (Integer/Long/
    * Boolean unboxing is routed by RECEIVER in jni_fake.c, not here.) */
   if (has(cls,"java/util/Iterator") && has(m,"hasNext")){
@@ -452,8 +582,24 @@ void unity_dispatch_void(void *recv, const void *id_, va_list va){ const struct 
   const char *cls=id->cls, *m=id->name;
   if (has(cls,"java/io/InputStream") && has(m,"close")){ UHandle*h=recv;
     if(is_uh(h,UJ_INPUTSTREAM)&&h->fp){fclose(h->fp);h->fp=NULL;} return; }
+  /* Scanner.close() closes its backing stream in Java. Guarded at both ends so
+   * a later InputStream.close() cannot double-fclose. */
+  if (has(cls,"java/util/Scanner") && has(m,"close")){
+    UHandle*h=recv;
+    UHandle*src=(is_uh(h,UJ_SCANNER))?(UHandle*)h->src:NULL;
+    if(src&&is_uh(src,UJ_INPUTSTREAM)&&src->fp){fclose(src->fp);src->fp=NULL;}
+    if(is_uh(h,UJ_SCANNER))h->src=NULL;
+    return;
+  }
   if (has(cls,"AssetFileDescriptor") && has(m,"close")){ UHandle*a=recv;
-    if(is_uh(a,UJ_AFD)&&a->fd>=0){close(a->fd);a->fd=-1;} return; }
+    if(is_uh(a,UJ_AFD)&&a->fd>=0){
+#if VEC_ASSET_PACK
+      if(asset_pack_fd_is(a->fd)) asset_pack_close_fd(a->fd); else
+#endif
+        close(a->fd);
+      a->fd=-1;
+    }
+    return; }
   if (has(cls,"SharedPreferences$Editor") && has(m,"apply")){ debugPrintf("[prefs] apply\n"); prefs_flush(); return; }
   if (has(cls,"SharedPreferences$Editor") && has(m,"putString")){ /* if routed here as void */
     const char*k=jni_string_utf(va_arg(va,void*)); const char*v=jni_string_utf(va_arg(va,void*));

@@ -80,6 +80,11 @@ int  fakefd_pipe(int fds[2]);
 long fakefd_read(int fd, void *buf, unsigned long n);
 long fakefd_write(int fd, const void *buf, unsigned long n);
 int  fakefd_close(int fd);
+int  fakefd_open_mem(const void *data, unsigned long size, int copy);
+long fakefd_lseek(int fd, long off, int whence);
+long fakefd_pread(int fd, void *buf, unsigned long n, long off);
+int  fakefd_stat(int fd, unsigned long long *size, unsigned long long *ino);
+const void *fakefd_data(int fd, unsigned long *size);
 
 // build the ANativeActivity the glue's onCreate consumes. Paths must outlive it.
 ANativeActivity *android_make_activity(void *vm, void *env, void *clazz,

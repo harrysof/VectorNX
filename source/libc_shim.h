@@ -74,9 +74,18 @@ int rename_fake(const char *oldp, const char *newp);
 
 /* frame-spike counters (libc_shim.c); main.c reports their per-frame delta on a hitch */
 extern unsigned nx_stat_open, nx_stat_commit, nx_stat_mmap, nx_stat_gcstop;
+extern uint64_t nx_stat_open_ticks;
+
+/* SD commit pacing: async for the render loop, sync for focus/exit. */
+void nx_sd_async_init(void);
+void nx_sd_async_shutdown(void);
+void nx_sd_flush(void);
+void nx_sd_flush_async(void);
+void nx_sd_commit_now(void);   /* synchronous, serialised with the worker */
 int fstat_fake(int fd, struct bionic_stat *st);
 int lstat_fake(const char *path, struct bionic_stat *st);
 void *readdir_fake(void *dirp);
+int closedir_fake(void *dirp);
 char *realpath_fake(const char *path, char *resolved);
 int strerror_r_fake(int err, char *buf, size_t len);
 int statvfs_fake(const char *path, void *buf);

@@ -51,6 +51,14 @@
 void  unity_jni_init(const char *data_root);
 int   unity_owns_class(const char *cls);          /* 1 if this module handles it */
 
+/* java.util.Scanner(InputStream, charset). Called from jni_fake.c's constructor
+ * dispatcher for:
+ *   new Scanner(getAssets().open("bin/Data/boot.config"), "UTF-8")
+ *       .useDelimiter("\\A").next()
+ * Without it the constructor produced a label-only object and Unity parsed an
+ * empty boot.config. */
+void  *unity_make_scanner(void *inputstream);
+
 void     *unity_dispatch_object(void *recv, const void *id, va_list va);
 uint64_t  unity_dispatch_int   (void *recv, const void *id, va_list va); /* int/bool/long */
 void      unity_dispatch_void  (void *recv, const void *id, va_list va);

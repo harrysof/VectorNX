@@ -18,6 +18,13 @@
 
 // File-only logger (DEBUG_LOG builds only): open once + flush per line so the tail survives a
 // crash, mutex-serialised across engine threads. Drops the high-frequency dlsym/dlopen/JNI spam.
+/* Runtime gate: config.txt `log=0` turns the file off after read_config().
+ * It starts at 1 so the boot lines (including the config read itself) are
+ * durable if something fails before the setting is known. This is the switch
+ * that removes per-frame SD writes from a play session; the compile-time
+ * DEBUG_LOG still has to be 1 for the code to exist. */
+int g_debug_log = 1;
+
 #if DEBUG_LOG
 static Mutex g_log_lock;
 static int log_is_noisy(const char *t) {
@@ -34,6 +41,12 @@ int debugPrintf(char *text, ...) {
   static FILE *f = NULL;
   static int pending;
   va_list list;
+  /* log=0 silences the play build, but never the two lines that matter when
+   * something has gone wrong: the exception dump and the watchdog's stall
+   * report. Both are rare, so they do not reintroduce per-frame SD traffic. */
+  if (!g_debug_log &&
+      strncmp(text, "[crash]", 7) &&
+      strncmp(text, "[wd]", 4)) return 0;
   if (log_is_noisy(text)) return 0;
   mutexLock(&g_log_lock);
   if (!f) f = fopen(LOG_NAME, "a");

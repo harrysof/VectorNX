@@ -366,23 +366,21 @@ static void push(int id, float x, float y, int phase) {
   e->id = id; e->x = x; e->y = y; e->phase = phase;
 }
 
-/* Touch: the panel always reports in its own space (1280x720) regardless of the
- * resolution we render at, so scale into render space -- otherwise the right and
- * bottom edges (and the corners) are physically unreachable. */
-static void do_touch(void) {
-  HidTouchScreenState ts = {0};
-  hidGetTouchScreenStates(&ts, 1);
-
+/* Apply one captured touchscreen sample. The panel always reports in its own
+ * space (1280x720) regardless of the resolution we render at, so scale into
+ * render space -- otherwise the right and bottom edges (and the corners) are
+ * physically unreachable. */
+static void do_touch_state(const HidTouchScreenState *ts) {
   const int slots = s_cfg.max_touch_slots;
   int now[16] = {0};
-  int count = ts.count > slots ? slots : ts.count;
+  int count = (int)ts->count > slots ? slots : (int)ts->count;
 
   const float sx = (float)s_cfg.screen_w / (float)s_cfg.panel_w;
   const float sy = (float)s_cfg.screen_h / (float)s_cfg.panel_h;
 
   for (int i = 0; i < count; i++) {
-    float x = (float)ts.touches[i].x * sx;
-    float y = (float)ts.touches[i].y * sy;
+    float x = (float)ts->touches[i].x * sx;
+    float y = (float)ts->touches[i].y * sy;
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x > s_cfg.screen_w - 1) x = (float)(s_cfg.screen_w - 1);
@@ -395,6 +393,56 @@ static void do_touch(void) {
     if (s_touch_active[i] && !now[i])
       push(i, s_touch_x[i], s_touch_y[i], NXP_UP);
     s_touch_active[i] = now[i];
+  }
+}
+
+/* Replay EVERY touchscreen sample captured since the last frame.
+ *
+ * hidGetTouchScreenStates(&ts, 1) returns only the newest entry in the
+ * system's HID ring. Everything the panel captured between two frames was
+ * discarded: a fast swipe could lose its DOWN or UP entirely, and surviving
+ * touches were quantised to frame boundaries. That is exactly the wrong
+ * behaviour for Vector, whose entire input is swipe gestures, and it becomes
+ * worse during a 90-130 ms I/O frame.
+ *
+ * The ring is newest-first, so walk it backwards to replay oldest -> newest.
+ * sampling_number is used to skip samples already handled -- reading the ring
+ * does not consume it, and without the check every frame would replay the same
+ * touches and synthesise phantom gestures. */
+#define NXP_TOUCH_STATES 16
+static void do_touch(void) {
+  static HidTouchScreenState st[NXP_TOUCH_STATES];
+  static u64 s_last_sample;
+  static int s_primed;
+  static unsigned s_saturated;
+
+  const int n = (int)hidGetTouchScreenStates(st, NXP_TOUCH_STATES);
+  if (n <= 0) return;
+  if (n >= NXP_TOUCH_STATES) s_saturated++;
+
+  /* The ring is system-owned and already holds samples from before this
+   * process existed (HOME menu / hbmenu). Adopt the newest sampling number on
+   * the first call so those are not injected as a phantom first-frame tap. */
+  if (!s_primed) {
+    s_primed = 1;
+    s_last_sample = st[0].sampling_number;
+    return;
+  }
+
+  for (int i = n - 1; i >= 0; i--) {          /* oldest -> newest */
+    if (st[i].sampling_number <= s_last_sample) continue;
+    do_touch_state(&st[i]);
+  }
+  if (st[0].sampling_number > s_last_sample)
+    s_last_sample = st[0].sampling_number;
+
+  if (s_saturated) {
+    static int warned;
+    if (!warned) {
+      warned = 1;
+      logf_("nxp: touch ring saturated (%u reads at %d states) -- "
+            "older samples may have been lost\n", s_saturated, NXP_TOUCH_STATES);
+    }
   }
 }
 

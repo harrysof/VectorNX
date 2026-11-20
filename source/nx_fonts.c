@@ -43,6 +43,8 @@ typedef struct {
   const char *file;      /* name exposed as /system/fonts/<file>          */
   const char *scripts;   /* for the log; what this face is here to cover  */
   int         ok;
+  uint8_t    *mem;       /* decoded face kept in RAM (open_fake serves it) */
+  size_t      mem_size;
 } FontEntry;
 
 /* Standard already carries Latin, Cyrillic, Greek, kana and the common kanji;
@@ -169,6 +171,24 @@ static int write_all(const char *path, const void *data, size_t len) {
   return 0;
 }
 
+/* Read a cached face into RAM. Keeping it costs a few MB but removes the
+ * repeated SD opens Unity performs while assembling its fallback chain. */
+static uint8_t *font_read_all(const char *path, size_t *size) {
+  *size = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+  long n = ftell(f);
+  if (n <= 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+  uint8_t *p = malloc((size_t)n);
+  if (!p) { fclose(f); return NULL; }
+  size_t got = fread(p, 1, (size_t)n, f);
+  fclose(f);
+  if (got != (size_t)n) { free(p); return NULL; }
+  *size = got;
+  return p;
+}
+
 int nx_fonts_init(const char *game_home) {
   if (g_ready) return g_ready;
   snprintf(g_dir, sizeof g_dir, "%s/" FONT_DIR_NAME, game_home);
@@ -187,11 +207,17 @@ int nx_fonts_init(const char *game_home) {
     snprintf(path, sizeof path, "%s/%s", g_dir, g_fonts[i].file);
 
     /* Cached from a previous boot? Decoding is not free, and this runs before
-     * the first frame. */
+     * the first frame. Read it into RAM as well: open_fake() serves the face
+     * from that copy, so Unity's repeated fallback probes never touch SD. */
     struct stat st;
     if (stat(path, &st) == 0 && st.st_size > 0) {
-      g_fonts[i].ok = 1; made++;
-      continue;
+      g_fonts[i].mem = font_read_all(path, &g_fonts[i].mem_size);
+      if (g_fonts[i].mem) {
+        g_fonts[i].ok = 1; made++;
+        debugPrintf("[font] %s <- cached file, %u KB (RAM-cached)\n",
+                    g_fonts[i].file, (unsigned)(g_fonts[i].mem_size >> 10));
+        continue;
+      }
     }
 
     PlFontData fd;
@@ -216,9 +242,14 @@ int nx_fonts_init(const char *game_home) {
     }
     if (write_all(path, buf + off, fd.size - (size_t)off) == 0) {
       g_fonts[i].ok = 1; made++;
-      debugPrintf("[font] %s <- shared font %d (%s), %u KB\n",
+      /* Keep the decoded face; open_fake() serves it from here. buf is
+       * intentionally not freed -- mem points inside it. */
+      g_fonts[i].mem = buf + off;
+      g_fonts[i].mem_size = fd.size - (size_t)off;
+      buf = NULL;
+      debugPrintf("[font] %s <- shared font %d (%s), %u KB (RAM-cached)\n",
                   g_fonts[i].file, (int)g_fonts[i].type, g_fonts[i].scripts,
-                  (unsigned)((fd.size - (size_t)off) >> 10));
+                  (unsigned)(g_fonts[i].mem_size >> 10));
     } else {
       debugPrintf("[font] could not write %s\n", path);
     }
@@ -295,6 +326,24 @@ const char *nx_fonts_resolve(const char *path) {
   return path;
 }
 
+/* In-memory face lookup for open_fake(). `path` is the resolved cache path
+ * (<game_home>/.fonts/<file>), because every filesystem entry point calls
+ * nx_fonts_resolve() first. */
+const void *nx_fonts_data(const char *path, size_t *size) {
+  if (size) *size = 0;
+  if (!g_ready || !path) return NULL;
+  char p[320];
+  for (int i = 0; i < FONT_COUNT; i++) {
+    if (!g_fonts[i].ok || !g_fonts[i].mem) continue;
+    snprintf(p, sizeof p, "%s/%s", g_dir, g_fonts[i].file);
+    if (!strcmp(p, path)) {
+      if (size) *size = g_fonts[i].mem_size;
+      return g_fonts[i].mem;
+    }
+  }
+  return NULL;
+}
+
 /* Log the first hit on each distinct path. Boot 1 of the font work produced
  * "6/6 system fonts available" and then complete silence -- fonts present,
  * nothing asking for them -- which gave no way to tell "Unity never looks" from
@@ -351,6 +400,7 @@ int nx_fonts_is_config_path(const char *path) {
   if (!g_ready || !path) return 0;
   return !strcmp(path, "/etc/fonts.xml") ||
          !strcmp(path, "/system/etc/fonts.xml") ||
+         !strcmp(path, "/system/fonts/fonts.xml") ||
          !strcmp(path, "/etc/system_fonts.xml") ||
          !strcmp(path, "/system/etc/system_fonts.xml") ||
          !strcmp(path, "/etc/fallback_fonts.xml") ||
