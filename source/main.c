@@ -351,9 +351,10 @@ static void vec_force_target_framerate(void) {
     debugPrintf("[fps] managed overrides: targetFrameRate=%p vSyncCount=%p\n",
                 (void *)set_tfr, (void *)set_vsync);
   }
-  const int fps = (config.framerate == 30) ? 30 : 60;
-  if (set_tfr)   set_tfr(fps);
-  if (set_vsync) set_vsync(fps == 30 ? 2 : 1);
+  /* Hard-locked 60. Re-asserted every second below; a quality change or a
+   * scene load can otherwise put Unity's mobile 30 fps default back. */
+  if (set_tfr)   set_tfr(60);
+  if (set_vsync) set_vsync(1);
 }
 #else
 static void vec_force_target_framerate(void) { }
@@ -660,7 +661,7 @@ int main(int argc, char *argv[]) {
     /* Frame 2 is the earliest point the managed runtime is fully live; a
      * quality change or scene load can reapply Unity's 30 fps mobile default,
      * so re-assert it periodically. */
-    if (frame == 2 || (frame % 300) == 0) vec_force_target_framerate();
+    if (frame == 2 || (frame % 60) == 0) vec_force_target_framerate();
     if (frame == 2) {
       extern int g_debug_log;
       debugPrintf("[boot] boot complete; log=%d from here\n", config.log);

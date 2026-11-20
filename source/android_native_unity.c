@@ -55,7 +55,10 @@ extern int screen_width, screen_height;   /* the render resolution main.c resolv
  * re-asserts it after the surface is created; lcgo's note is unambiguous:
  * unset means the compositor does not throttle at all. */
 static u32 nx_swap_interval(void) {
-  return (config.framerate == 30) ? 2u : 1u;
+  /* Hard-locked 60: one present per display refresh. There is no 30 fps mode
+   * in the shipped build; the config key is kept only so older config.txt files
+   * still parse and are rewritten. */
+  return 1u;
 }
 
 void android_native_update_mode(void){

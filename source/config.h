@@ -43,7 +43,7 @@
 #define CS_ANDROID_ID    "9f6a13c8d4e75b20"
 
 #define CONFIG_NAME "config.txt"
-#define VECTOR_VERSION "0.6.0-perf2"
+#define VECTOR_VERSION "0.6.1-perf3"
 #define LOG_NAME    "sdmc:/switch/vector/debug.log"
 
 /* Game data root == the .nro's own folder (SoLoader SD convention):
@@ -108,7 +108,7 @@ typedef struct {
   char language[16];    /* "auto" => follow Switch system language, else ISO code */
   int  render_width;    /* internal render size; compositor upscales to the panel */
   int  render_height;
-  int  framerate;       /* 60 or 30; drives swap interval + targetFrameRate */
+  int  framerate;       /* always 60; kept for config.txt compatibility       */
   int  log;             /* 1 = write debug.log (slow); 0 = play build       */
 } Config;
 

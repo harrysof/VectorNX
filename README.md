@@ -192,8 +192,10 @@ log=0
 - `render_width` / `render_height`: internal render size. The default
   **960x540** keeps the frame rate up; use `1280` / `720` for full quality.
   The Switch compositor upscales to the panel.
-- `framerate`: `60` or `30`. 60 sets the window swap interval to 1 and forces
-  Unity's managed `targetFrameRate` to 60; 30 uses swap interval 2.
+- `framerate`: hard-locked at **60**. The key is kept for compatibility; a
+  value of `30` is ignored and rewritten to `60`. The window swap interval is
+  pinned to 1 and Unity's managed `targetFrameRate` is re-asserted every
+  second.
 - `log`: `0` for play (no per-frame SD writes), `1` when you need `debug.log`.
 
 ---
@@ -207,8 +209,8 @@ This build targets the two causes the hardware logs actually showed:
   free-running 60 Hz sleep loop is gone; two independent 60 Hz clocks beat
   against each other and produce periodic held/repeated frames.
 - **Managed frame cap.** Unity's Android player defaults `targetFrameRate` to
-  30. The loader re-asserts 60 (or 30) through `il2cpp_resolve_icall` without
-  any libil2cpp offsets.
+  30. The loader hard-locks it to 60 and re-asserts it every second through
+  `il2cpp_resolve_icall`, without any libil2cpp offsets.
 - **SD commit stalls.** `fsdevCommitDevice("sdmc")` is now performed by a
   low-priority worker instead of on the game thread. Focus-change and exit
   still commit synchronously.
@@ -242,7 +244,7 @@ guessed.
   times, `open=... openms=...`, `read=...ms/...KB` and slow file opens.
 - If the screen is black, set `log=1` in `config.txt`, relaunch, and check the
   first line of `sdmc:/switch/vector/debug.log`. It must say
-  `vector_nx 0.6.0-perf2`.
+  `vector_nx 0.6.1-perf3`.
 - Audio is routed through OpenSL ES. If it is silent, the `[fmod]` lines in
   `debug.log` show which stage failed.
 

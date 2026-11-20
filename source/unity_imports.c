@@ -173,9 +173,10 @@ void*z_memrchr(const void*s,int c,unsigned long n){ const unsigned char*p=(const
  * quality profile; on this port the swapchain must be paced by the display,
  * not by the loader's sleep loop. Clamp to the configured rate. */
 static EGLBoolean vec_eglSwapInterval(EGLDisplay dpy, EGLint interval) {
-  const EGLint want = (config.framerate == 30) ? 2 : 1;
+  /* Hard-locked 60: ignore any engine request for 0 (uncapped) or 2 (30). */
+  (void)config;
   (void)interval;
-  return eglSwapInterval(dpy, want);
+  return eglSwapInterval(dpy, 1);
 }
 
 DynLibFunction unity_dynlib_functions[] = {

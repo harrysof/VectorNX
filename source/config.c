@@ -5,7 +5,7 @@
  *   language=auto|<ISO code>
  *   render_width=<pixels>    internal render size; compositor upscales
  *   render_height=<pixels>
- *   framerate=60|30          swap interval + Unity targetFrameRate
+ *   framerate=60             hard-locked 60; 30 is ignored
  *   log=0|1                  debug.log on/off
  *
  * The defaults are 960x540: 16:9, 75% of the panel, and enough headroom for a
@@ -62,7 +62,9 @@ int read_config(const char *file) {
       continue;
     }
     if (sscanf(line, "framerate=%d", &ival) == 1) {
-      config.framerate = (ival == 30) ? 30 : 60;
+      /* Hard-locked 60. Accept the key for old configs, but never honour 30. */
+      (void)ival;
+      config.framerate = 60;
       seen |= 8;
       continue;
     }
@@ -91,16 +93,16 @@ int write_config(const char *file) {
     "render_width=%d\n"
     "render_height=%d\n"
     "\n"
-    "# framerate: 60 or 30. 60 drives the window swap interval to 1 and forces\n"
-    "# Unity's targetFrameRate to 60; 30 uses swap interval 2.\n"
-    "framerate=%d\n"
+    "# framerate: hard-locked at 60. The key is kept for compatibility; a value\n"
+    "# of 30 is ignored and rewritten to 60.\n"
+    "framerate=60\n"
     "\n"
     "# log: 1 writes debug.log to the SD card (useful for diagnosing a boot or\n"
     "# a crash, but the per-frame lines cost I/O); 0 is the play setting.\n"
     "log=%d\n",
     config.language[0] ? config.language : "auto",
     config.render_width, config.render_height,
-    config.framerate, config.log);
+    config.log);
   fclose(f);
   return 0;
 }
